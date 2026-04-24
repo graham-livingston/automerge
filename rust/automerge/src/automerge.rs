@@ -2012,7 +2012,6 @@ impl ReadDoc for Automerge {
         typ.ok_or_else(|| AutomergeError::InvalidObjId(obj.to_string()))
     }
 
-    #[inline(never)]
     fn get_missing_deps(&self, heads: &[ChangeHash]) -> Vec<ChangeHash> {
         let mut missing = HashSet::new();
 
