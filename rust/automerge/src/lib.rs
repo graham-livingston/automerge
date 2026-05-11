@@ -235,8 +235,7 @@
 macro_rules! log {
      ( $( $t:tt )* ) => {
           {
-            use $crate::__log;
-            __log!( $( $t )* );
+            $crate::__log!( $( $t )* );
           }
      }
  }
@@ -267,7 +266,6 @@ mod change_graph;
 mod change_queue;
 mod clock;
 mod columnar;
-mod convert;
 mod cursor;
 pub mod error;
 mod exid;

@@ -13,7 +13,7 @@ pub use load::VerificationMode;
 
 pub(crate) use {
     bundle::{BundleMetadata, BundleStorage},
-    change::{AsChangeOp, Change, ChangeOp, Compressed, ReadChangeOpError},
+    change::{Change, Compressed, ReadChangeOpError},
     chunk::{CheckSum, Chunk, ChunkType, Header},
     columns::{ColumnSpec, Columns, RawColumn, RawColumns},
     document::{CompressConfig, Document},

@@ -8,7 +8,8 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use super::{change::Unverified, parse, BundleStorage, Change, Compressed, Document, MAGIC_BYTES};
-use crate::{columnar::encoding::leb128::ulebsize, ChangeHash};
+use crate::ChangeHash;
+use hexane::ulebsize;
 
 pub(crate) enum Chunk<'a> {
     Document(Document<'a>),

@@ -48,12 +48,36 @@ impl OpId {
     pub fn delta(&self, other: &Self, delta: u64) -> bool {
         self.1 == other.1 && self.0 + delta == other.0
     }
+
+    /// Translate this op id into the internal `crate::types::OpId` shape,
+    /// with the actor field replaced by its index from `actor_idx`.
+    pub(crate) fn import(
+        &self,
+        actor_idx: &std::collections::HashMap<ActorId, usize>,
+    ) -> crate::types::OpId {
+        let idx = *actor_idx.get(&self.1).expect("actor missing from actor_idx");
+        crate::types::OpId::new(self.0, idx)
+    }
 }
 
 #[derive(Eq, PartialEq, Debug, Hash, Clone)]
 pub enum ObjectId {
     Id(OpId),
     Root,
+}
+
+impl ObjectId {
+    /// Translate to the internal `crate::types::ObjId`, looking actors up in
+    /// `actor_idx`.
+    pub(crate) fn import(
+        &self,
+        actor_idx: &std::collections::HashMap<ActorId, usize>,
+    ) -> crate::types::ObjId {
+        match self {
+            ObjectId::Root => crate::types::ObjId::root(),
+            ObjectId::Id(opid) => crate::types::ObjId(opid.import(actor_idx)),
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, Debug, Hash, Clone)]
@@ -87,6 +111,18 @@ impl ElementId {
             ElementId::Id(id) => Some(ElementId::Id(id.increment_by(by))),
         }
     }
+
+    /// Translate to the internal `crate::types::ElemId`, looking actors up in
+    /// `actor_idx`.
+    pub(crate) fn import(
+        &self,
+        actor_idx: &std::collections::HashMap<ActorId, usize>,
+    ) -> crate::types::ElemId {
+        match self {
+            ElementId::Head => crate::types::ElemId::head(),
+            ElementId::Id(opid) => crate::types::ElemId(opid.import(actor_idx)),
+        }
+    }
 }
 
 #[derive(Serialize, PartialEq, Eq, Debug, Hash, Clone)]
@@ -105,6 +141,18 @@ impl Key {
         match self {
             Key::Map(_) => true,
             Key::Seq(_) => false,
+        }
+    }
+
+    /// Translate to the op_set2 `KeyRef<'static>`, looking actors up in
+    /// `actor_idx` for the `Seq` arm.
+    pub(crate) fn import(
+        &self,
+        actor_idx: &std::collections::HashMap<ActorId, usize>,
+    ) -> crate::op_set2::types::KeyRef<'static> {
+        match self {
+            Key::Map(s) => crate::op_set2::types::KeyRef::Map(std::borrow::Cow::Owned(s.to_string())),
+            Key::Seq(elem) => crate::op_set2::types::KeyRef::Seq(elem.import(actor_idx)),
         }
     }
 

@@ -36,12 +36,6 @@ pub(crate) use column_builder::{
 pub(crate) mod raw_column;
 pub(crate) use raw_column::{RawColumn, RawColumns};
 
-#[derive(Debug, thiserror::Error)]
-#[error("mismatching column at {index}.")]
-pub(crate) struct MismatchingColumn {
-    pub(crate) index: usize,
-}
-
 pub(crate) mod compression {
     #[derive(Clone, Debug)]
     pub(crate) struct Unknown;
@@ -64,16 +58,6 @@ pub(crate) struct Columns {
 }
 
 impl Columns {
-    pub(crate) fn empty() -> Self {
-        Self {
-            columns: Vec::new(),
-        }
-    }
-
-    pub(crate) fn append(&mut self, col: Column) {
-        self.columns.push(col)
-    }
-
     pub(crate) fn parse2<'a, I: Iterator<Item = &'a RawColumn<compression::Uncompressed>>>(
         data_size: usize,
         cols: I,

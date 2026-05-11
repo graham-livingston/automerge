@@ -233,24 +233,6 @@ pub enum OpType {
     MarkEnd(bool),
 }
 
-impl OpType {
-    pub(crate) fn validate_action_and_value(
-        action: u64,
-        value: &ScalarValue,
-    ) -> Result<(), error::InvalidOpType> {
-        match action {
-            0..=4 => Ok(()),
-            5 => match value {
-                ScalarValue::Int(_) | ScalarValue::Uint(_) => Ok(()),
-                _ => Err(error::InvalidOpType::NonNumericInc),
-            },
-            6 => Ok(()),
-            7 => Ok(()),
-            _ => Err(error::InvalidOpType::UnknownAction(action)),
-        }
-    }
-}
-
 impl From<ObjType> for OpType {
     fn from(v: ObjType) -> Self {
         OpType::Make(v)
@@ -441,6 +423,15 @@ impl OpId {
 
     pub(crate) fn new(counter: u64, actor: usize) -> Self {
         Self(counter.try_into().unwrap(), actor.try_into().unwrap())
+    }
+
+    /// Fallible counterpart to [`Self::new`]. Returns
+    /// [`std::num::TryFromIntError`] when `counter` or `actor` exceeds the
+    /// underlying `u32` storage. Use this when reading from an untrusted
+    /// source (e.g. a chunk on the wire) instead of `new`, which panics on
+    /// overflow.
+    pub(crate) fn try_new(counter: u64, actor: usize) -> Result<Self, std::num::TryFromIntError> {
+        Ok(Self(counter.try_into()?, actor.try_into()?))
     }
 
     pub(crate) fn map(&self, actor_map: &[usize]) -> Result<OpId, AutomergeError> {

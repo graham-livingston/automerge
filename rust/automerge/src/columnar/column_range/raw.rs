@@ -1,15 +1,9 @@
-use std::{borrow::Cow, ops::Range};
-
-use crate::columnar::encoding::RawDecoder;
+use std::ops::Range;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RawRange(Range<usize>);
 
 impl RawRange {
-    pub(crate) fn decoder<'a>(&self, data: &'a [u8]) -> RawDecoder<'a> {
-        RawDecoder::from(Cow::Borrowed(&data[self.0.clone()]))
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

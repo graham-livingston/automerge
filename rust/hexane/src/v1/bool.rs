@@ -453,6 +453,10 @@ impl<'a> BoolDecoder<'a> {
             self.remaining = 0;
         }
     }
+
+    pub fn try_next(&mut self) -> Option<Result<bool, crate::PackError>> {
+        Iterator::next(self).map(Ok)
+    }
 }
 
 impl<'a> Iterator for BoolDecoder<'a> {

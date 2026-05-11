@@ -5,13 +5,15 @@ use crate::op_set2::SuccInsert;
 use crate::types::{
     ActorId, ElemId, ObjId, ObjType, OpId, Prop, ScalarValue, SequenceType, SmallHashMap,
 };
-use crate::{Automerge, Change, ChangeHash, PatchLog, PatchLogMismatch};
+use crate::{Automerge, Change, ChangeHash, PatchLog};
 use crate::{AutomergeError, TextEncoding};
 
-use super::super::op::{ChangeOp, Op, OpBuilder};
+use super::super::op::{ChangeOp, Op};
 use super::super::op_set::{ObjIdIter, ObjIndex, OpIter, OpSet};
 
+#[cfg(test)]
 use std::borrow::Cow;
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -793,24 +795,25 @@ impl BatchApply {
         }
     }
 
-    fn import_ops(&mut self, doc: &mut Automerge) {
+    fn import_ops(&mut self, doc: &mut Automerge) -> Result<(), AutomergeError> {
         for c in &self.changes {
-            doc.import_ops_to(c, &mut self.ops).unwrap();
+            doc.import_ops_to(c, &mut self.ops)?;
             doc.update_history(c);
         }
         doc.remove_unused_actors(true);
+        Ok(())
     }
 
     pub(crate) fn apply(
         &mut self,
         doc: &mut Automerge,
         log: &mut PatchLog,
-    ) -> Result<(), PatchLogMismatch> {
+    ) -> Result<(), AutomergeError> {
         self.insert_new_actors(doc);
 
         log.migrate_actors(&doc.ops().actors)?;
 
-        self.import_ops(doc);
+        self.import_ops(doc)?;
 
         let mut obj_info = doc.ops().obj_info.clone();
 
@@ -1101,40 +1104,24 @@ impl Automerge {
     fn import_ops(&mut self, change: &Change) -> Result<Vec<ChangeOp>, AutomergeError> {
         let actors: Vec<_> = change
             .actors()
-            .map(|a| self.ops.lookup_actor(a).unwrap())
-            .collect();
+            .map(|a| {
+                self.ops
+                    .lookup_actor(a)
+                    .ok_or_else(|| AutomergeError::InvalidActorId(a.to_hex_string()))
+            })
+            .collect::<Result<_, _>>()?;
 
         change
             .iter_ops()
-            .enumerate()
-            .map(|(i, c)| {
-                let id = OpId::new(change.start_op().get() + i as u64, 0).map(&actors)?;
-                let key = c.key.map(&actors)?;
-                let obj = c.obj.map(&actors)?;
-                let pred = c
-                    .pred
-                    .into_iter()
-                    .map(|id| id.map(&actors))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let bld = OpBuilder {
-                    id,
-                    obj,
-                    key,
-                    action: c.action.try_into()?,
-                    value: c.val.into_ref(),
-                    mark_name: c.mark_name.map(String::from).map(Cow::Owned),
-                    expand: c.expand,
-                    insert: c.insert,
-                    pred,
-                };
-                let change = ChangeOp {
+            .map(|mut bld| {
+                bld.remap_actors(&actors)?;
+                Ok(ChangeOp {
                     pos: None,
                     subsort: 0,
                     conflicted: false,
                     succ: vec![],
-                    bld,
-                };
-                Ok(change)
+                    bld: bld.into_owned(),
+                })
             })
             .collect()
     }

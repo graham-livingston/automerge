@@ -172,6 +172,96 @@ impl<'a, T: RleValue> RleDecoder<'a, T> {
             self.byte_pos += vlen;
         }
     }
+
+    /// Fallible counterpart to [`Iterator::next`]. Returns `Some(Err(_))` if
+    /// the underlying bytes are malformed (truncated LEB128, invalid value
+    /// encoding, etc.) instead of panicking. Suitable for streaming over data
+    /// that hasn't been validated by [`Column::load`](super::super::Column::load).
+    ///
+    /// After an error is returned the decoder is poisoned and will yield
+    /// `None` on subsequent calls — callers should stop iterating.
+    pub fn try_next(
+        &mut self,
+    ) -> Option<Result<<T as ColumnValueRef>::Get<'a>, PackError>> {
+        loop {
+            if self.remaining > 0 {
+                self.remaining -= 1;
+                return match &self.state {
+                    RleDecoderState::Repeat(v) => Some(Ok(*v)),
+                    RleDecoderState::Literal => match T::try_unpack(&self.data[self.byte_pos..]) {
+                        Ok((vlen, value)) => {
+                            self.byte_pos += vlen;
+                            Some(Ok(value))
+                        }
+                        Err(e) => {
+                            self.poison();
+                            Some(Err(e))
+                        }
+                    },
+                    RleDecoderState::Null => Some(Ok(T::get_null())),
+                    RleDecoderState::Idle => None,
+                };
+            }
+            if let Err(e) = self.try_advance_run() {
+                self.poison();
+                return Some(Err(e));
+            }
+            if self.remaining == 0 {
+                return None;
+            }
+        }
+    }
+
+    fn poison(&mut self) {
+        self.state = RleDecoderState::Idle;
+        self.remaining = 0;
+        self.byte_pos = self.data.len();
+    }
+
+    fn try_advance_run(&mut self) -> Result<(), PackError> {
+        if self.byte_pos >= self.data.len() {
+            self.state = RleDecoderState::Idle;
+            self.remaining = 0;
+            return Ok(());
+        }
+        // A truncated count prefix terminates the stream rather than erroring,
+        // matching the infallible `advance_run`'s graceful handling. Genuine
+        // malformations (bad value encoding, bad null-count) flow through as
+        // PackError below.
+        let (count_bytes, count_raw) = match try_read_signed(&self.data[self.byte_pos..]) {
+            Ok(v) => v,
+            Err(_) => {
+                self.state = RleDecoderState::Idle;
+                self.remaining = 0;
+                return Ok(());
+            }
+        };
+
+        match count_raw {
+            n if n > 0 => {
+                let count = n as usize;
+                let value_start = self.byte_pos + count_bytes;
+                let (vlen, value) = T::try_unpack(&self.data[value_start..])?;
+                self.byte_pos = value_start + vlen;
+                self.remaining = count;
+                self.state = RleDecoderState::Repeat(value);
+            }
+            n if n < 0 => {
+                let total = (-n) as usize;
+                self.byte_pos += count_bytes;
+                self.remaining = total;
+                self.state = RleDecoderState::Literal;
+            }
+            _ => {
+                let (ncb, null_count) =
+                    try_read_unsigned(&self.data[self.byte_pos + count_bytes..])?;
+                self.byte_pos += count_bytes + ncb;
+                self.remaining = null_count as usize;
+                self.state = RleDecoderState::Null;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<'a, T: RleValue> Iterator for RleDecoder<'a, T> {

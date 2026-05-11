@@ -1,23 +1,22 @@
 use std::{borrow::Cow, num::NonZeroU64};
 
-use crate::{
-    columnar::Key as StoredKey,
-    storage::{
-        change::{Unverified, Verified},
-        parse, Change as StoredChange, ChangeOp, Chunk, Compressed, ReadChangeOpError,
-    },
-    types::{ActorId, ChangeHash, ElemId},
-};
+use crate::op_set2::change::{build_change, BuildChangeMetadata };
+use crate::op_set2::op::OpBuilder;
+use crate::op_set2::types::{Action, KeyRef};
+use crate::storage::{change, parse, Change as StoredChange, Chunk, Compressed, ReadChangeOpError};
+use crate::types::{ActorId, ChangeHash, ElemId, OpId};
+use crate::legacy;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Change {
-    stored: StoredChange<'static, Verified>,
+    stored: StoredChange<'static, change::Verified>,
     compression: CompressionState,
     len: usize,
 }
 
 impl Change {
-    pub(crate) fn new(stored: StoredChange<'static, Verified>) -> Self {
+    pub(crate) fn new(stored: StoredChange<'static, change::Verified>) -> Self {
         let len = stored.len();
         Self {
             stored,
@@ -27,7 +26,7 @@ impl Change {
     }
 
     pub(crate) fn new_from_unverified(
-        stored: StoredChange<'static, Unverified>,
+        stored: StoredChange<'static, change::Unverified>,
         compressed: Option<Compressed<'static>>,
     ) -> Result<Self, ReadChangeOpError> {
         let mut len = 0;
@@ -114,7 +113,7 @@ impl Change {
         self.stored.bytes()
     }
 
-    pub(crate) fn iter_ops(&self) -> impl Iterator<Item = ChangeOp> + '_ {
+    pub(crate) fn iter_ops(&self) -> crate::storage::change::ChangeOpIter<'_> {
         self.stored.iter_ops()
     }
 
@@ -142,18 +141,18 @@ enum CompressionState {
     TooSmallToCompress,
 }
 
-impl AsRef<StoredChange<'static, Verified>> for Change {
-    fn as_ref(&self) -> &StoredChange<'static, Verified> {
+impl AsRef<StoredChange<'static, change::Verified>> for Change {
+    fn as_ref(&self) -> &StoredChange<'static, change::Verified> {
         &self.stored
     }
 }
 
-impl From<StoredChange<'static, Verified>> for Change {
-    fn from(s: StoredChange<'static, Verified>) -> Self {
+impl From<StoredChange<'static, change::Verified>> for Change {
+    fn from(s: StoredChange<'static, change::Verified>) -> Self {
         Change::new(s)
     }
 }
-impl From<Change> for StoredChange<'static, Verified> {
+impl From<Change> for StoredChange<'static, change::Verified> {
     fn from(c: Change) -> Self {
         c.stored
     }
@@ -190,104 +189,84 @@ impl<'a> TryFrom<&'a [u8]> for Change {
     }
 }
 
-impl<'a> TryFrom<StoredChange<'a, Unverified>> for Change {
+impl<'a> TryFrom<StoredChange<'a, change::Unverified>> for Change {
     type Error = ReadChangeOpError;
 
-    fn try_from(c: StoredChange<'a, Unverified>) -> Result<Self, Self::Error> {
+    fn try_from(c: StoredChange<'a, change::Unverified>) -> Result<Self, Self::Error> {
         Self::new_from_unverified(c.into_owned(), None)
     }
 }
 
 impl From<crate::ExpandedChange> for Change {
     fn from(e: crate::ExpandedChange) -> Self {
-        let stored = StoredChange::builder()
-            .with_actor(e.actor_id)
-            .with_extra_bytes(e.extra_bytes)
-            .with_seq(e.seq)
-            .with_dependencies(e.deps)
-            .with_timestamp(e.time)
-            .with_start_op(e.start_op)
-            .with_message(e.message)
-            .build(e.operations.iter());
-        match stored {
-            Ok(c) => Change::new(c),
-            Err(crate::storage::change::PredOutOfOrder) => {
-                // Should never happen because we use `SortedVec` in legacy::Op::pred
-                panic!("preds out of order");
+        // Collect all actors (sorted lex via BTreeSet) so the ActorMapper's
+        // index-order walk produces the same other_actors ordering the legacy
+        // ChangeActors path would have.
+        let mut all_actors: BTreeSet<ActorId> = BTreeSet::new();
+        all_actors.insert(e.actor_id.clone());
+        for op in &e.operations {
+            if let legacy::ObjectId::Id(id) = &op.obj {
+                all_actors.insert(id.1.clone());
+            }
+            if let legacy::Key::Seq(legacy::ElementId::Id(id)) = &op.key {
+                all_actors.insert(id.1.clone());
+            }
+            for pred in op.pred.iter() {
+                all_actors.insert(pred.1.clone());
             }
         }
-    }
-}
+        let actors: Vec<ActorId> = all_actors.into_iter().collect();
+        let actor_idx: HashMap<ActorId, usize> = actors
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, a)| (a, i))
+            .collect();
+        let default_actor = *actor_idx.get(&e.actor_id).unwrap();
 
-mod convert_expanded {
-    use std::borrow::Cow;
+        let start_op = e.start_op.get();
 
-    use crate::{convert, legacy, storage::AsChangeOp, types::ActorId, ScalarValue};
+        let ops: Vec<OpBuilder<'static>> = e
+            .operations
+            .iter()
+            .enumerate()
+            .map(|(i, op)| OpBuilder {
+                id: OpId::new(start_op + i as u64, default_actor),
+                obj: op.obj.import(&actor_idx),
+                key: op.key.import(&actor_idx),
+                pred: op.pred.iter().map(|p| p.import(&actor_idx)).collect(),
+                action: Action::try_from(op.action.action_index())
+                    .expect("legacy action_index always returns 0..=7"),
+                value: op
+                    .primitive_value()
+                    .map(|v| v.into_ref())
+                    .unwrap_or(crate::op_set2::types::ScalarValue::Null),
+                mark_name: match &op.action {
+                    legacy::OpType::MarkBegin(legacy::MarkData { name, .. }) => {
+                        Some(Cow::Owned(name.to_string()))
+                    }
+                    _ => None,
+                },
+                insert: op.insert,
+                expand: op.action.expand(),
+            })
+            .collect();
 
-    impl<'a> AsChangeOp<'a> for &'a legacy::Op {
-        type ActorId = &'a ActorId;
-        type OpId = &'a legacy::OpId;
-        type PredIter = std::slice::Iter<'a, legacy::OpId>;
+        let max_op = start_op + e.operations.len() as u64 - 1;
 
-        fn action(&self) -> u64 {
-            self.action.action_index()
-        }
+        let meta = BuildChangeMetadata {
+            actor: default_actor,
+            seq: e.seq,
+            max_op,
+            timestamp: e.time,
+            message: e.message.as_ref().map(|s| Cow::Owned(s.clone())),
+            deps: (0..e.deps.len() as u64).collect(),
+            extra: Cow::Borrowed(&e.extra_bytes),
+            start_op,
+            builder: 0,
+        };
 
-        fn insert(&self) -> bool {
-            self.insert
-        }
-
-        fn pred(&self) -> Self::PredIter {
-            self.pred.iter()
-        }
-
-        fn key(&self) -> convert::Key<'a, Self::OpId> {
-            match &self.key {
-                legacy::Key::Map(s) => convert::Key::Prop(Cow::Borrowed(s)),
-                legacy::Key::Seq(legacy::ElementId::Head) => {
-                    convert::Key::Elem(convert::ElemId::Head)
-                }
-                legacy::Key::Seq(legacy::ElementId::Id(o)) => {
-                    convert::Key::Elem(convert::ElemId::Op(o))
-                }
-            }
-        }
-
-        fn obj(&self) -> convert::ObjId<Self::OpId> {
-            match &self.obj {
-                legacy::ObjectId::Root => convert::ObjId::Root,
-                legacy::ObjectId::Id(o) => convert::ObjId::Op(o),
-            }
-        }
-
-        fn val(&self) -> Cow<'a, crate::ScalarValue> {
-            match self.primitive_value() {
-                Some(v) => Cow::Owned(v),
-                None => Cow::Owned(ScalarValue::Null),
-            }
-        }
-
-        fn expand(&self) -> bool {
-            self.action.expand()
-        }
-
-        fn mark_name(&self) -> Option<Cow<'a, smol_str::SmolStr>> {
-            if let legacy::OpType::MarkBegin(legacy::MarkData { name, .. }) = &self.action {
-                Some(Cow::Borrowed(name))
-            } else {
-                None
-            }
-        }
-    }
-
-    impl<'a> convert::OpId<&'a ActorId> for &'a legacy::OpId {
-        fn counter(&self) -> u64 {
-            legacy::OpId::counter(self)
-        }
-
-        fn actor(&self) -> &'a ActorId {
-            &self.1
-        }
+        Change::new(build_change(&ops, &meta, &e.deps.as_slice(), &actors))
     }
 }
 
@@ -300,45 +279,38 @@ impl From<&Change> for crate::ExpandedChange {
             .collect::<std::collections::HashMap<_, _>>();
         let operations = c
             .iter_ops()
-            .map(|o| crate::legacy::Op {
-                action: crate::legacy::OpType::from_parts(crate::legacy::OpTypeParts {
-                    action: o.action,
-                    value: o.val,
+            .map(|o| legacy::Op {
+                action: legacy::OpType::from_parts(legacy::OpTypeParts {
+                    action: u64::from(o.action),
+                    value: o.value.into_legacy(),
                     expand: o.expand,
-                    mark_name: o.mark_name,
+                    mark_name: o.mark_name.map(|c| smol_str::SmolStr::from(c.as_ref())),
                 }),
                 insert: o.insert,
                 key: match o.key {
-                    StoredKey::Elem(e) if e.is_head() => {
-                        crate::legacy::Key::Seq(crate::legacy::ElementId::Head)
+                    KeyRef::Seq(e) if e.is_head() => {
+                        legacy::Key::Seq(legacy::ElementId::Head)
                     }
-                    StoredKey::Elem(ElemId(o)) => {
-                        crate::legacy::Key::Seq(crate::legacy::ElementId::Id(
-                            crate::legacy::OpId::new(o.counter(), actors.get(&o.actor()).unwrap()),
-                        ))
-                    }
-                    StoredKey::Prop(p) => crate::legacy::Key::Map(p),
+                    KeyRef::Seq(ElemId(eo)) => legacy::Key::Seq(
+                        legacy::ElementId::Id(legacy::OpId::new(
+                            eo.counter(),
+                            actors.get(&eo.actor()).unwrap(),
+                        )),
+                    ),
+                    KeyRef::Map(s) => legacy::Key::Map(smol_str::SmolStr::from(s.as_ref())),
                 },
-                //obj: if o.obj.is_root() {
                 obj: if let Some(id) = o.obj.id() {
-                    crate::legacy::ObjectId::Id(crate::legacy::OpId::new(
+                    legacy::ObjectId::Id(legacy::OpId::new(
                         id.counter(),
                         actors.get(&id.actor()).unwrap(),
                     ))
                 } else {
-                    crate::legacy::ObjectId::Root
-                    /*
-                                    } else {
-                                        crate::legacy::ObjectId::Id(crate::legacy::OpId::new(
-                                            o.obj.opid().counter(),
-                                            actors.get(&o.obj.opid().actor()).unwrap(),
-                                        ))
-                    */
+                    legacy::ObjectId::Root
                 },
                 pred: o
                     .pred
                     .into_iter()
-                    .map(|p| crate::legacy::OpId::new(p.counter(), actors.get(&p.actor()).unwrap()))
+                    .map(|p| legacy::OpId::new(p.counter(), actors.get(&p.actor()).unwrap()))
                     .collect(),
             })
             .collect::<Vec<_>>();

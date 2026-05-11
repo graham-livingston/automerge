@@ -2,7 +2,7 @@ use super::meta::ValueMeta;
 use super::op::{AsChangeOp, OpBuilder};
 use super::types::{Action, ActorIdx};
 use crate::change_graph::ChangeGraph;
-use crate::storage::change::{ChangeOpsColumns as ChangeOpsColumns2, Verified};
+use crate::storage::change::Verified;
 use crate::storage::{Change, ChunkType, Header};
 use crate::types::{ActorId, ChangeHash};
 use std::borrow::Cow;
@@ -24,6 +24,12 @@ pub(crate) trait GetHash {
 impl GetHash for Vec<crate::Change> {
     fn get_hash(&self, index: usize) -> Option<ChangeHash> {
         Some(self.get(index)?.hash())
+    }
+}
+
+impl GetHash for &[ChangeHash] {
+    fn get_hash(&self, index: usize) -> Option<ChangeHash> {
+        self.get(index).copied()
     }
 }
 
@@ -96,7 +102,8 @@ where
         length_prefixed_bytes(actor, &mut data);
     }
 
-    ops_meta.raw_columns().write(&mut data);
+    let raw_cols = ops_meta.to_raw_columns();
+    raw_cols.write(&mut data);
 
     let ops_data_start = data.len();
     let ops_data = ops_data_start..(ops_data_start + col_data.len());
@@ -126,7 +133,7 @@ where
         start_op: NonZero::new(start_op).unwrap(),
         timestamp: meta.timestamp,
         message: meta.message.as_ref().map(|s| s.to_string()),
-        ops_meta,
+        ops_meta: raw_cols,
         ops_data,
         extra_bytes,
         num_ops,
@@ -146,7 +153,7 @@ impl Ord for OpBuilder<'_> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ChangeOpsColumns {
     pub(crate) obj_actor: Range<usize>,
     pub(crate) obj_ctr: Range<usize>,
@@ -162,6 +169,100 @@ pub(crate) struct ChangeOpsColumns {
     pub(crate) pred_ctr: Range<usize>,
     pub(crate) expand: Range<usize>,
     pub(crate) mark_name: Range<usize>,
+}
+
+impl ChangeOpsColumns {
+    /// Lower these byte ranges into a `RawColumns<Uncompressed>`, attaching a
+    /// `ColumnSpec` to each. Mirrors the chunk's column manifest exactly so
+    /// subsequent `RawColumns::write` produces the on-wire byte layout.
+    ///
+    /// Optional columns (value bytes, pred actor/ctr, expand, mark_name) are
+    /// only included when their range is non-empty — matching the
+    /// hexane encoders' "elide if all-default" behaviour.
+    pub(crate) fn to_raw_columns(
+        &self,
+    ) -> crate::storage::RawColumns<crate::storage::columns::compression::Uncompressed> {
+        use crate::storage::columns::{ColumnId, ColumnSpec, ColumnType, RawColumn};
+
+        const OBJ: ColumnId = ColumnId::new(0);
+        const KEY: ColumnId = ColumnId::new(1);
+        const INSERT: ColumnId = ColumnId::new(3);
+        const ACTION: ColumnId = ColumnId::new(4);
+        const VAL: ColumnId = ColumnId::new(5);
+        const PRED: ColumnId = ColumnId::new(7);
+        const EXPAND: ColumnId = ColumnId::new(9);
+        const MARK_NAME: ColumnId = ColumnId::new(10);
+
+        let mut cols = vec![
+            RawColumn::new(
+                ColumnSpec::new(OBJ, ColumnType::Actor, false),
+                self.obj_actor.clone(),
+            ),
+            RawColumn::new(
+                ColumnSpec::new(OBJ, ColumnType::Integer, false),
+                self.obj_ctr.clone(),
+            ),
+            RawColumn::new(
+                ColumnSpec::new(KEY, ColumnType::Actor, false),
+                self.key_actor.clone(),
+            ),
+            RawColumn::new(
+                ColumnSpec::new(KEY, ColumnType::DeltaInteger, false),
+                self.key_ctr.clone(),
+            ),
+            RawColumn::new(
+                ColumnSpec::new(KEY, ColumnType::String, false),
+                self.key_str.clone(),
+            ),
+            RawColumn::new(
+                ColumnSpec::new(INSERT, ColumnType::Boolean, false),
+                self.insert.clone(),
+            ),
+            RawColumn::new(
+                ColumnSpec::new(ACTION, ColumnType::Integer, false),
+                self.action.clone(),
+            ),
+            RawColumn::new(
+                ColumnSpec::new(VAL, ColumnType::ValueMetadata, false),
+                self.value_meta.clone(),
+            ),
+        ];
+        if !self.value.is_empty() {
+            cols.push(RawColumn::new(
+                ColumnSpec::new(VAL, ColumnType::Value, false),
+                self.value.clone(),
+            ));
+        }
+        cols.push(RawColumn::new(
+            ColumnSpec::new(PRED, ColumnType::Group, false),
+            self.pred_count.clone(),
+        ));
+        if !self.pred_actor.is_empty() {
+            cols.extend([
+                RawColumn::new(
+                    ColumnSpec::new(PRED, ColumnType::Actor, false),
+                    self.pred_actor.clone(),
+                ),
+                RawColumn::new(
+                    ColumnSpec::new(PRED, ColumnType::DeltaInteger, false),
+                    self.pred_ctr.clone(),
+                ),
+            ]);
+        }
+        if !self.expand.is_empty() {
+            cols.push(RawColumn::new(
+                ColumnSpec::new(EXPAND, ColumnType::Boolean, false),
+                self.expand.clone(),
+            ));
+        }
+        if !self.mark_name.is_empty() {
+            cols.push(RawColumn::new(
+                ColumnSpec::new(MARK_NAME, ColumnType::String, false),
+                self.mark_name.clone(),
+            ));
+        }
+        cols.into_iter().collect()
+    }
 }
 
 pub(crate) fn shift_range(range: Range<usize>, by: usize) -> Range<usize> {
@@ -187,12 +288,12 @@ fn write_change_ops<T>(
     change_actor: usize,
     data: &mut Vec<u8>,
     mapper: &mut ActorMapper<'_>,
-) -> ChangeOpsColumns2
+) -> ChangeOpsColumns
 where
     T: AsChangeOp,
 {
     if ops.is_empty() {
-        return ChangeOpsColumns::default().into();
+        return ChangeOpsColumns::default();
     }
 
     mapper.remap_actors(ops, change_actor);
@@ -253,7 +354,7 @@ where
         None,
     );
 
-    let cols = ChangeOpsColumns {
+    ChangeOpsColumns {
         obj_actor,
         obj_ctr,
         key_actor,
@@ -268,9 +369,7 @@ where
         pred_ctr,
         expand,
         mark_name,
-    };
-
-    cols.into()
+    }
 }
 
 // The many small mallocs in the remap_actors

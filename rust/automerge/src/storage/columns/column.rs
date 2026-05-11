@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use crate::columnar::column_range::generic::GenericColumnRange;
 
-use super::{ColumnId, ColumnSpec, ColumnType};
+use super::ColumnSpec;
 
 /// A combination of a column specification and the range of data associated with it. Note that
 /// multiple (adjacent) ranges can be associated with one column as some columns are composite.
@@ -22,18 +22,6 @@ impl Column {
 impl Column {
     pub(crate) fn range(&self) -> Range<usize> {
         self.range.range()
-    }
-
-    pub(crate) fn into_ranges(self) -> GenericColumnRange {
-        self.range
-    }
-
-    pub(crate) fn col_type(&self) -> ColumnType {
-        self.spec.col_type()
-    }
-
-    pub(crate) fn id(&self) -> ColumnId {
-        self.spec.id()
     }
 
     pub(crate) fn spec(&self) -> ColumnSpec {

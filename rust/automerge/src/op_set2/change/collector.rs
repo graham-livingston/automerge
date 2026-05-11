@@ -231,7 +231,8 @@ impl<'a> OpEncoderStrategy<'a> {
             length_prefixed_bytes(actor, &mut data);
         }
 
-        ops_meta.raw_columns().write(&mut data);
+        let raw_cols = ops_meta.to_raw_columns();
+        raw_cols.write(&mut data);
 
         let ops_data_start = data.len();
         let ops_data = ops_data_start..(ops_data_start + col_data.len());
@@ -261,7 +262,7 @@ impl<'a> OpEncoderStrategy<'a> {
             start_op: NonZero::new(start_op).unwrap(),
             timestamp: change.timestamp,
             message: change.message.as_ref().map(|s| s.to_string()),
-            ops_meta,
+            ops_meta: raw_cols,
             ops_data,
             extra_bytes,
             num_ops,
@@ -518,7 +519,7 @@ impl<'a> ProgressiveEncoder<'a> {
         let mut data = vec![];
         let num_ops = self.len as u64;
         let start_op = self.start_op;
-        let meta = self.save_to(change.actor, &mut data, mapper).into();
+        let meta = self.save_to(change.actor, &mut data, mapper);
         let actor = mapper.actors[change.actor].clone();
         let other_actors = mapper.iter().collect();
 
@@ -966,7 +967,7 @@ impl GetHash for BundleDeps<'_> {
 pub(crate) struct ChangeCols {
     pub(crate) num_ops: u64,
     pub(crate) start_op: Option<u64>,
-    pub(crate) meta: crate::storage::change::ChangeOpsColumns,
+    pub(crate) meta: super::ChangeOpsColumns,
     pub(crate) actor: ActorId,
     pub(crate) other_actors: Vec<ActorId>,
     pub(crate) data: Vec<u8>,

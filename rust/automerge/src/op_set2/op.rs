@@ -187,6 +187,46 @@ pub(crate) struct OpBuilder<'a> {
     pub(crate) pred: Vec<OpId>,
 }
 
+impl<'a> OpBuilder<'a> {
+    /// Translate every actor index in this builder from change-local to
+    /// global via `actor_map`. Mutates `id`, `obj`, the `Seq` arm of `key`,
+    /// and each entry in `pred`. Other fields are untouched.
+    pub(crate) fn remap_actors(
+        &mut self,
+        actor_map: &[usize],
+    ) -> Result<(), crate::AutomergeError> {
+        self.id = self.id.map(actor_map)?;
+        self.obj = self.obj.map(actor_map)?;
+        if let KeyRef::Seq(elem) = &mut self.key {
+            *elem = elem.map(actor_map)?;
+        }
+        for pred in &mut self.pred {
+            *pred = pred.map(actor_map)?;
+        }
+        Ok(())
+    }
+
+    /// Upgrade chunk-borrowed string fields to `'static` ownership. Used at
+    /// the boundary where a streamed `OpBuilder<'a>` needs to land in storage
+    /// that outlives the chunk bytes (`ChangeOp { bld: OpBuilder<'static>, ..}`).
+    pub(crate) fn into_owned(self) -> OpBuilder<'static> {
+        OpBuilder {
+            id: self.id,
+            obj: self.obj,
+            action: self.action,
+            key: match self.key {
+                KeyRef::Map(s) => KeyRef::Map(Cow::Owned(s.into_owned())),
+                KeyRef::Seq(e) => KeyRef::Seq(e),
+            },
+            value: self.value.into_owned(),
+            insert: self.insert,
+            expand: self.expand,
+            mark_name: self.mark_name.map(|c| Cow::Owned(c.into_owned())),
+            pred: self.pred,
+        }
+    }
+}
+
 impl OpBuilder<'_> {
     pub(crate) fn mark_index(&self) -> Option<MarkIndexBuilder> {
         match (self.action, &self.mark_name) {

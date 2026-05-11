@@ -1,18 +1,25 @@
-use std::{borrow::Cow, io::Write, marker::PhantomData, num::NonZeroU64, ops::Range};
+use std::{borrow::Cow, marker::PhantomData, num::NonZeroU64, ops::Range};
 
-use crate::{convert, ActorId, ChangeHash, ScalarValue};
+use crate::{ActorId, ChangeHash};
 
-use super::{parse, shift_range, CheckSum, ChunkType, Header, RawColumns};
+use super::{parse, CheckSum, Header, RawColumns};
 
-mod change_op_columns;
-pub(crate) use change_op_columns::ChangeOpsColumns;
-pub(crate) use change_op_columns::{ChangeOp, ReadChangeOpError};
+mod iter;
+pub(crate) use iter::{ChangeOpIter, ChangeOpIterUnverified};
 
-mod change_actors;
-pub(crate) use change_actors::PredOutOfOrder;
 mod compressed;
-mod op_with_change_actors;
 pub(crate) use compressed::Compressed;
+
+#[derive(thiserror::Error, Debug)]
+#[error(transparent)]
+pub enum ReadChangeOpError {
+    #[error(transparent)]
+    DecodeError(#[from] crate::columnar::encoding::DecodeColumnError),
+    #[error(transparent)]
+    InvalidOpType(#[from] crate::error::InvalidOpType),
+    #[error("counter too large")]
+    CounterTooLarge,
+}
 
 pub(crate) const DEFLATE_MIN_SIZE: usize = 256;
 
@@ -52,7 +59,7 @@ pub(crate) struct Change<'a, O: OpReadState> {
     pub(crate) start_op: NonZeroU64,
     pub(crate) timestamp: i64,
     pub(crate) message: Option<String>,
-    pub(crate) ops_meta: ChangeOpsColumns,
+    pub(crate) ops_meta: RawColumns<crate::storage::columns::compression::Uncompressed>,
     /// The range in `Self::bytes` where the ops column data is
     pub(crate) ops_data: Range<usize>,
     pub(crate) extra_bytes: Range<usize>,
@@ -78,8 +85,8 @@ pub(crate) enum ParseError {
     Header(#[from] super::chunk::error::Header),
     #[error("change contained compressed columns")]
     CompressedChangeCols,
-    #[error("invalid change cols: {0}")]
-    InvalidColumns(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("invalid op column: {0}")]
+    InvalidOpColumn(u32),
 }
 
 impl<'a> Change<'a, Unverified> {
@@ -128,8 +135,6 @@ impl<'a> Change<'a, Unverified> {
             .uncompressed()
             .ok_or(parse::ParseError::Error(ParseError::CompressedChangeCols))?;
 
-        let ops_meta = ChangeOpsColumns::try_from(ops_meta)?;
-
         Ok((
             parse::Input::empty(),
             Change {
@@ -157,10 +162,8 @@ impl<'a> Change<'a, Unverified> {
 
     /// Iterate over the ops in this chunk. The iterator will return an error if any of the ops are
     /// malformed.
-    pub(crate) fn iter_ops(
-        &'a self,
-    ) -> impl Iterator<Item = Result<ChangeOp, ReadChangeOpError>> + Clone + 'a {
-        self.ops_meta.iter(self.ops_data())
+    pub(crate) fn iter_ops(&'a self) -> ChangeOpIterUnverified<'a> {
+        ChangeOpIterUnverified::new(&self.ops_meta, self.ops_data(), self.start_op)
     }
 
     /// Verify all the ops in this change executing `f` for each one
@@ -170,7 +173,7 @@ impl<'a> Change<'a, Unverified> {
     ///
     /// # Errors
     /// * If there is an error reading an operation
-    pub(crate) fn verify_ops<F: FnMut(ChangeOp)>(
+    pub(crate) fn verify_ops<F: FnMut(crate::op_set2::op::OpBuilder<'_>)>(
         self,
         mut f: F,
     ) -> Result<Change<'a, Verified>, ReadChangeOpError> {
@@ -206,14 +209,10 @@ impl<'a> Change<'a, Verified> {
         self.num_ops
     }
 
-    pub(crate) fn builder() -> ChangeBuilder<Unset, Unset, Unset, Unset> {
-        ChangeBuilder::new()
-    }
-
-    pub(crate) fn iter_ops(&'a self) -> impl Iterator<Item = ChangeOp> + Clone + 'a {
+    pub(crate) fn iter_ops(&'a self) -> ChangeOpIter<'a> {
         // SAFETY: This unwrap is okay because a `Change<'_, Verified>` can only be constructed
         // using either `verify_ops` or `Builder::build`, so we know the ops columns are valid.
-        self.ops_meta.iter(self.ops_data()).map(|o| o.unwrap())
+        ChangeOpIter::new(&self.ops_meta, self.ops_data(), self.start_op)
     }
 }
 
@@ -298,226 +297,5 @@ impl<O: OpReadState> Change<'_, O> {
         } else {
             None
         }
-    }
-}
-
-fn length_prefixed_bytes<B: AsRef<[u8]>>(b: B, out: &mut Vec<u8>) -> usize {
-    let prefix_len = leb128::write::unsigned(out, b.as_ref().len() as u64).unwrap();
-    out.write_all(b.as_ref()).unwrap();
-    prefix_len + b.as_ref().len()
-}
-
-// Bunch of type safe builder boilerplate
-pub(crate) struct Unset;
-pub(crate) struct Set<T> {
-    value: T,
-}
-
-#[allow(non_camel_case_types)]
-pub(crate) struct ChangeBuilder<START_OP, ACTOR, SEQ, TIME> {
-    dependencies: Vec<ChangeHash>,
-    actor: ACTOR,
-    seq: SEQ,
-    start_op: START_OP,
-    timestamp: TIME,
-    message: Option<String>,
-    extra_bytes: Option<Vec<u8>>,
-}
-
-impl ChangeBuilder<Unset, Unset, Unset, Unset> {
-    pub(crate) fn new() -> Self {
-        Self {
-            dependencies: vec![],
-            actor: Unset,
-            seq: Unset,
-            start_op: Unset,
-            timestamp: Unset,
-            message: None,
-            extra_bytes: None,
-        }
-    }
-}
-
-#[allow(non_camel_case_types)]
-impl<START_OP, ACTOR, SEQ, TIME> ChangeBuilder<START_OP, ACTOR, SEQ, TIME> {
-    pub(crate) fn with_dependencies(self, mut dependencies: Vec<ChangeHash>) -> Self {
-        dependencies.sort_unstable();
-        Self {
-            dependencies,
-            ..self
-        }
-    }
-
-    pub(crate) fn with_message(self, message: Option<String>) -> Self {
-        Self { message, ..self }
-    }
-
-    pub(crate) fn with_extra_bytes(self, extra_bytes: Vec<u8>) -> Self {
-        Self {
-            extra_bytes: Some(extra_bytes),
-            ..self
-        }
-    }
-}
-
-#[allow(non_camel_case_types)]
-impl<START_OP, ACTOR, TIME> ChangeBuilder<START_OP, ACTOR, Unset, TIME> {
-    pub(crate) fn with_seq(self, seq: u64) -> ChangeBuilder<START_OP, ACTOR, Set<u64>, TIME> {
-        ChangeBuilder {
-            dependencies: self.dependencies,
-            actor: self.actor,
-            seq: Set { value: seq },
-            start_op: self.start_op,
-            timestamp: self.timestamp,
-            message: self.message,
-            extra_bytes: self.extra_bytes,
-        }
-    }
-}
-
-#[allow(non_camel_case_types)]
-impl<START_OP, SEQ, TIME> ChangeBuilder<START_OP, Unset, SEQ, TIME> {
-    pub(crate) fn with_actor(
-        self,
-        actor: ActorId,
-    ) -> ChangeBuilder<START_OP, Set<ActorId>, SEQ, TIME> {
-        ChangeBuilder {
-            dependencies: self.dependencies,
-            actor: Set { value: actor },
-            seq: self.seq,
-            start_op: self.start_op,
-            timestamp: self.timestamp,
-            message: self.message,
-            extra_bytes: self.extra_bytes,
-        }
-    }
-}
-
-impl<ACTOR, SEQ, TIME> ChangeBuilder<Unset, ACTOR, SEQ, TIME> {
-    pub(crate) fn with_start_op(
-        self,
-        start_op: NonZeroU64,
-    ) -> ChangeBuilder<Set<NonZeroU64>, ACTOR, SEQ, TIME> {
-        ChangeBuilder {
-            dependencies: self.dependencies,
-            actor: self.actor,
-            seq: self.seq,
-            start_op: Set { value: start_op },
-            timestamp: self.timestamp,
-            message: self.message,
-            extra_bytes: self.extra_bytes,
-        }
-    }
-}
-
-#[allow(non_camel_case_types)]
-impl<START_OP, ACTOR, SEQ> ChangeBuilder<START_OP, ACTOR, SEQ, Unset> {
-    pub(crate) fn with_timestamp(self, time: i64) -> ChangeBuilder<START_OP, ACTOR, SEQ, Set<i64>> {
-        ChangeBuilder {
-            dependencies: self.dependencies,
-            actor: self.actor,
-            seq: self.seq,
-            start_op: self.start_op,
-            timestamp: Set { value: time },
-            message: self.message,
-            extra_bytes: self.extra_bytes,
-        }
-    }
-}
-
-/// A row to be encoded as a change op
-///
-/// The lifetime `'a` is the lifetime of the value and key data types. For types which cannot
-/// provide a reference (e.g. because they are decoding from some columnar storage on each
-/// iteration) this should be `'static`.
-pub(crate) trait AsChangeOp<'a> {
-    /// The type of the Actor ID component of the op IDs for this impl. This is typically either
-    /// `&'a ActorID` or `usize`
-    type ActorId;
-    /// The type of the op IDs this impl produces.
-    type OpId: convert::OpId<Self::ActorId>;
-    /// The type of the predecessor iterator returned by `Self::pred`. This can often be omitted
-    type PredIter: Iterator<Item = Self::OpId> + ExactSizeIterator;
-
-    fn obj(&self) -> convert::ObjId<Self::OpId>;
-    fn key(&self) -> convert::Key<'a, Self::OpId>;
-    fn insert(&self) -> bool;
-    fn action(&self) -> u64;
-    fn val(&self) -> Cow<'a, ScalarValue>;
-    fn pred(&self) -> Self::PredIter;
-    fn expand(&self) -> bool;
-    fn mark_name(&self) -> Option<Cow<'a, smol_str::SmolStr>>;
-}
-
-impl ChangeBuilder<Set<NonZeroU64>, Set<ActorId>, Set<u64>, Set<i64>> {
-    pub(crate) fn build<'a, 'b, A, I, O>(
-        self,
-        ops: I,
-    ) -> Result<Change<'static, Verified>, PredOutOfOrder>
-    where
-        A: AsChangeOp<'a, OpId = O> + 'a + std::fmt::Debug,
-        O: convert::OpId<&'a ActorId> + 'a,
-        I: Iterator<Item = A> + Clone + 'a + ExactSizeIterator,
-    {
-        let num_ops = ops.len();
-        let mut col_data = Vec::new();
-        let actors = change_actors::ChangeActors::new(self.actor.value, ops)?;
-        let cols = ChangeOpsColumns::encode(actors.iter(), &mut col_data);
-
-        let (actor, other_actors) = actors.done();
-
-        let mut data = Vec::with_capacity(col_data.len());
-        leb128::write::unsigned(&mut data, self.dependencies.len() as u64).unwrap();
-        for dep in &self.dependencies {
-            data.write_all(dep.as_bytes()).unwrap();
-        }
-        length_prefixed_bytes(&actor, &mut data);
-        leb128::write::unsigned(&mut data, self.seq.value).unwrap();
-        leb128::write::unsigned(&mut data, self.start_op.value.into()).unwrap();
-        leb128::write::signed(&mut data, self.timestamp.value).unwrap();
-        length_prefixed_bytes(
-            self.message.as_ref().map(|m| m.as_bytes()).unwrap_or(&[]),
-            &mut data,
-        );
-        leb128::write::unsigned(&mut data, other_actors.len() as u64).unwrap();
-        for actor in other_actors.iter() {
-            length_prefixed_bytes(actor, &mut data);
-        }
-        cols.raw_columns().write(&mut data);
-        let ops_data_start = data.len();
-        let ops_data = ops_data_start..(ops_data_start + col_data.len());
-
-        data.extend(col_data);
-        let extra_bytes =
-            data.len()..(data.len() + self.extra_bytes.as_ref().map(|e| e.len()).unwrap_or(0));
-        if let Some(extra) = self.extra_bytes {
-            data.extend(extra);
-        }
-
-        let header = Header::new(ChunkType::Change, &data);
-
-        let mut bytes = Vec::with_capacity(header.len() + data.len());
-        header.write(&mut bytes);
-        bytes.extend(data);
-
-        let ops_data = shift_range(ops_data, header.len());
-        let extra_bytes = shift_range(extra_bytes, header.len());
-
-        Ok(Change {
-            bytes: Cow::Owned(bytes),
-            header,
-            dependencies: self.dependencies,
-            actor,
-            other_actors,
-            seq: self.seq.value,
-            start_op: self.start_op.value,
-            timestamp: self.timestamp.value,
-            message: self.message,
-            ops_meta: cols,
-            ops_data,
-            extra_bytes,
-            num_ops,
-            _phantom: PhantomData,
-        })
     }
 }

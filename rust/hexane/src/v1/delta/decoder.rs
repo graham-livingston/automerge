@@ -11,6 +11,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 
 use super::DeltaValue;
+use crate::PackError;
 
 /// Streaming decoder over delta-encoded column bytes.  See module docs.
 ///
@@ -31,6 +32,20 @@ impl<'a, T: DeltaValue> DeltaDecoder<'a, T> {
             inner: crate::v1::decoder::<Option<i64>>(data),
             running: 0,
             _phantom: PhantomData,
+        }
+    }
+
+    /// Fallible counterpart to [`Iterator::next`]. Returns `Some(Err(_))` if
+    /// the underlying bytes are malformed instead of panicking. Suitable for
+    /// streaming over data that hasn't been validated by `Column::load`.
+    pub fn try_next(&mut self) -> Option<Result<T, PackError>> {
+        match self.inner.try_next()? {
+            Ok(None) => Some(Ok(T::null_value())),
+            Ok(Some(d)) => {
+                self.running += d;
+                Some(Ok(T::from_i64(self.running)))
+            }
+            Err(e) => Some(Err(e)),
         }
     }
 }
