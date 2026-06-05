@@ -55,7 +55,9 @@ impl OpId {
         &self,
         actor_idx: &std::collections::HashMap<ActorId, usize>,
     ) -> crate::types::OpId {
-        let idx = *actor_idx.get(&self.1).expect("actor missing from actor_idx");
+        let idx = *actor_idx
+            .get(&self.1)
+            .expect("actor missing from actor_idx");
         crate::types::OpId::new(self.0, idx)
     }
 }
@@ -151,7 +153,9 @@ impl Key {
         actor_idx: &std::collections::HashMap<ActorId, usize>,
     ) -> crate::op_set2::types::KeyRef<'static> {
         match self {
-            Key::Map(s) => crate::op_set2::types::KeyRef::Map(std::borrow::Cow::Owned(s.to_string())),
+            Key::Map(s) => {
+                crate::op_set2::types::KeyRef::Map(std::borrow::Cow::Owned(s.to_string()))
+            }
             Key::Seq(elem) => crate::op_set2::types::KeyRef::Seq(elem.import(actor_idx)),
         }
     }

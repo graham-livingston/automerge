@@ -1,11 +1,11 @@
 use std::{borrow::Cow, num::NonZeroU64};
 
-use crate::op_set2::change::{build_change, BuildChangeMetadata };
+use crate::legacy;
+use crate::op_set2::change::{build_change, BuildChangeMetadata};
 use crate::op_set2::op::OpBuilder;
 use crate::op_set2::types::{Action, KeyRef};
 use crate::storage::{change, parse, Change as StoredChange, Chunk, Compressed, ReadChangeOpError};
 use crate::types::{ActorId, ChangeHash, ElemId, OpId};
-use crate::legacy;
 use std::collections::{BTreeSet, HashMap};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -288,15 +288,10 @@ impl From<&Change> for crate::ExpandedChange {
                 }),
                 insert: o.insert,
                 key: match o.key {
-                    KeyRef::Seq(e) if e.is_head() => {
-                        legacy::Key::Seq(legacy::ElementId::Head)
-                    }
-                    KeyRef::Seq(ElemId(eo)) => legacy::Key::Seq(
-                        legacy::ElementId::Id(legacy::OpId::new(
-                            eo.counter(),
-                            actors.get(&eo.actor()).unwrap(),
-                        )),
-                    ),
+                    KeyRef::Seq(e) if e.is_head() => legacy::Key::Seq(legacy::ElementId::Head),
+                    KeyRef::Seq(ElemId(eo)) => legacy::Key::Seq(legacy::ElementId::Id(
+                        legacy::OpId::new(eo.counter(), actors.get(&eo.actor()).unwrap()),
+                    )),
                     KeyRef::Map(s) => legacy::Key::Map(smol_str::SmolStr::from(s.as_ref())),
                 },
                 obj: if let Some(id) = o.obj.id() {
