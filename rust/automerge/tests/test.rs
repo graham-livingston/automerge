@@ -2667,8 +2667,6 @@ fn reproduce_clock_cache_bug() {
 
     assert!(base.get_changes(&heads).is_empty());
 }
-<<<<<<< conflict 1 of 1
-+++++++ qzsmtkrq a4f584c8 "rust/automerge@0.10.0" (rebase destination)
 
 #[test]
 fn merge_panic_after_putting_value_equal_to_initial_value() {

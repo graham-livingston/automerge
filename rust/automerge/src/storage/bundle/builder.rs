@@ -9,7 +9,7 @@ use crate::op_set2::op::{Op, OpBuilder};
 use crate::op_set2::types::{ActionCursor, ActorCursor, ActorIdx, KeyRef, MetaCursor};
 use crate::op_set2::{ReadOpError, ScalarValue};
 use crate::storage::columns::{compression, ColumnType};
-use crate::storage::{ChunkType, Header, RawColumn, RawColumns};
+use crate::storage::{write_signature_table, ChunkType, Header, RawColumn, RawColumns};
 use crate::types::{ChangeHash, ObjId, OpId};
 
 use hexane::{
@@ -137,6 +137,7 @@ impl<'a> BundleBuilder<'a> {
             length_prefixed_bytes(actor, &mut data);
         }
 
+        let signatures_by_index = self.change_writer.signatures_by_index().to_vec();
         let mut change_bytes = vec![];
         let change_cols = self.change_writer.finish(&mapper, &mut change_bytes);
         let (changes_data, changes_meta) = change_cols.write(&mut data, change_bytes);
@@ -144,6 +145,13 @@ impl<'a> BundleBuilder<'a> {
         let mut ops_bytes = vec![];
         let ops_cols = self.op_writer.finish(&mapper, &mut ops_bytes);
         let (ops_data, ops_meta) = ops_cols.write(&mut data, ops_bytes);
+
+        write_signature_table(
+            &mut data,
+            signatures_by_index
+                .iter()
+                .map(|(idx, signature)| (*idx, signature)),
+        );
 
         let header = Header::new(ChunkType::Bundle, &data);
 
@@ -165,6 +173,7 @@ impl<'a> BundleBuilder<'a> {
             actors,
             changes_meta,
             changes_data,
+            signatures_by_index,
             _phantom: PhantomData,
         };
 
@@ -203,6 +212,7 @@ pub(crate) struct BundleChangeWriter<'a> {
     deps: Encoder<'a, DeltaCursor>,
     extra_count: Encoder<'a, UIntCursor>,
     extra: Vec<u8>,
+    signatures_by_index: Vec<(usize, crate::ChangeSignature)>,
 }
 
 impl<'a> BundleChangeWriter<'a> {
@@ -226,6 +236,10 @@ impl<'a> BundleChangeWriter<'a> {
         self.timestamp.append(change.timestamp);
         self.extra_count.append(change.extra.len() as u64);
         self.extra.extend_from_slice(&change.extra);
+        if let Some(signature) = &change.signature {
+            self.signatures_by_index
+                .push((self.len - 1, signature.clone()));
+        }
         self.dep_count.append(change.deps.len() as u64);
         for d in &change.deps {
             if let Some(i) = self.seen.get(d) {
@@ -265,6 +279,10 @@ impl<'a> BundleChangeWriter<'a> {
             extra_count,
             extra,
         }
+    }
+
+    fn signatures_by_index(&self) -> &[(usize, crate::ChangeSignature)] {
+        &self.signatures_by_index
     }
 }
 
